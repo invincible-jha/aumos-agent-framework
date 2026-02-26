@@ -1,0 +1,123 @@
+version: "3.9"
+
+services:
+  aumos-agent-framework:
+    build: .
+    container_name: aumos-agent-framework
+    ports:
+      - "8007:8000"
+    environment:
+      - AUMOS_SERVICE_NAME=aumos-agent-framework
+      - AUMOS_ENVIRONMENT=development
+      - AUMOS_DEBUG=true
+      - AUMOS_DATABASE__URL=postgresql+asyncpg://aumos:aumos_dev@postgres:5432/aumos
+      - AUMOS_KAFKA__BROKERS=kafka:9092
+      - AUMOS_REDIS__URL=redis://redis:6379/0
+      - TEMPORAL_SERVER_URL=temporal:7233
+      - LLM_SERVING_URL=http://host.docker.internal:8001
+    depends_on:
+      - postgres
+      - kafka
+      - redis
+      - temporal
+    volumes:
+      - ./src:/app/src
+    networks:
+      - aumos-dev
+
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: aumos-agent-postgres
+    environment:
+      POSTGRES_USER: aumos
+      POSTGRES_PASSWORD: aumos_dev
+      POSTGRES_DB: aumos
+    ports:
+      - "5439:5432"
+    volumes:
+      - agent_postgres_data:/var/lib/postgresql/data
+    networks:
+      - aumos-dev
+
+  redis:
+    image: redis:7-alpine
+    container_name: aumos-agent-redis
+    ports:
+      - "6386:6379"
+    volumes:
+      - agent_redis_data:/data
+    networks:
+      - aumos-dev
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    container_name: aumos-agent-kafka
+    ports:
+      - "9099:9092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      CLUSTER_ID: aumos-agent-cluster
+    volumes:
+      - agent_kafka_data:/var/lib/kafka/data
+    networks:
+      - aumos-dev
+
+  schema-registry:
+    image: confluentinc/cp-schema-registry:7.6.0
+    container_name: aumos-agent-schema-registry
+    ports:
+      - "8088:8081"
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: kafka:9092
+    depends_on:
+      - kafka
+    networks:
+      - aumos-dev
+
+  temporal:
+    image: temporalio/auto-setup:1.24.0
+    container_name: aumos-temporal
+    ports:
+      - "7233:7233"
+    environment:
+      - DB=postgres12
+      - DB_PORT=5432
+      - POSTGRES_USER=aumos
+      - POSTGRES_PWD=aumos_dev
+      - POSTGRES_SEEDS=postgres
+      - DYNAMIC_CONFIG_FILE_PATH=config/dynamicconfig/development-sql.yaml
+    depends_on:
+      - postgres
+    networks:
+      - aumos-dev
+
+  temporal-ui:
+    image: temporalio/ui:2.26.2
+    container_name: aumos-temporal-ui
+    ports:
+      - "8088:8080"
+    environment:
+      - TEMPORAL_ADDRESS=temporal:7233
+      - TEMPORAL_CORS_ORIGINS=http://localhost:3000
+    depends_on:
+      - temporal
+    networks:
+      - aumos-dev
+
+volumes:
+  agent_postgres_data:
+  agent_redis_data:
+  agent_kafka_data:
+
+networks:
+  aumos-dev:
+    driver: bridge
