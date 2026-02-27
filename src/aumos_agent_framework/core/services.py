@@ -14,10 +14,18 @@ from aumos_common.errors import NotFoundError, PermissionDeniedError
 from aumos_common.observability import get_logger
 
 from aumos_agent_framework.core.interfaces import (
+    ActionExecutorProtocol,
+    AgentMemoryManagerProtocol,
+    AgentRuntimeProtocol,
     CircuitBreakerProtocol,
     DurableExecutorProtocol,
     HITLGateProtocol,
+    MultiAgentCoordinatorProtocol,
+    ObservabilityHooksProtocol,
+    ReasoningEngineProtocol,
+    SecuritySandboxProtocol,
     SessionIsolatorProtocol,
+    SkillComposerProtocol,
     ToolRegistryProtocol,
     WorkflowEngineProtocol,
 )
@@ -970,3 +978,461 @@ class ToolRegistryService:
     ) -> list[dict[str, Any]]:
         """List all available tools with optional privilege filter."""
         return await self._tool_registry.list_tools(tenant_id, min_privilege_level)
+
+
+class AgentMemoryService:
+    """High-level service for agent short-term and long-term memory operations.
+
+    Wraps AgentMemoryManagerProtocol with business-logic defaults and
+    privilege-aware consolidation triggers.
+    """
+
+    def __init__(self, memory_manager: AgentMemoryManagerProtocol) -> None:
+        """Initialize with a memory manager adapter.
+
+        Args:
+            memory_manager: Adapter implementing AgentMemoryManagerProtocol.
+        """
+        self._memory = memory_manager
+
+    async def record_conversation_turn(
+        self,
+        agent_id: uuid.UUID,
+        tenant_id: str,
+        role: str,
+        content: str,
+        importance: float = 0.5,
+    ) -> str:
+        """Record a single conversation turn in short-term memory.
+
+        Args:
+            agent_id: Agent whose memory to update.
+            tenant_id: Tenant context.
+            role: Message role ('user', 'assistant', 'system').
+            content: Message content.
+            importance: Importance score for consolidation gating.
+
+        Returns:
+            Memory entry ID string.
+        """
+        return await self._memory.add_short_term(
+            agent_id=agent_id,
+            tenant_id=tenant_id,
+            content=content,
+            memory_type="conversation",
+            importance=importance,
+            metadata={"role": role},
+        )
+
+    async def record_tool_output(
+        self,
+        agent_id: uuid.UUID,
+        tenant_id: str,
+        tool_name: str,
+        output_summary: str,
+        importance: float = 0.6,
+    ) -> str:
+        """Record a tool execution output in short-term memory.
+
+        Args:
+            agent_id: Agent whose memory to update.
+            tenant_id: Tenant context.
+            tool_name: Name of the tool that produced the output.
+            output_summary: Summarized output string.
+            importance: Importance score.
+
+        Returns:
+            Memory entry ID string.
+        """
+        return await self._memory.add_short_term(
+            agent_id=agent_id,
+            tenant_id=tenant_id,
+            content=output_summary,
+            memory_type="tool_output",
+            importance=importance,
+            metadata={"tool_name": tool_name},
+        )
+
+    async def get_recent_context(
+        self,
+        agent_id: uuid.UUID,
+        tenant_id: str,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        """Retrieve recent short-term memory for context injection.
+
+        Args:
+            agent_id: Agent whose memory to retrieve.
+            tenant_id: Tenant context.
+            limit: Maximum entries to return.
+
+        Returns:
+            List of recent memory entry dicts.
+        """
+        return await self._memory.get_short_term(
+            agent_id=agent_id,
+            tenant_id=tenant_id,
+            limit=limit,
+            memory_type=None,
+        )
+
+    async def search_relevant_memories(
+        self,
+        agent_id: uuid.UUID,
+        tenant_id: str,
+        query_embedding: list[float],
+        limit: int = 10,
+        topic: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Search long-term memory for contextually relevant entries.
+
+        Args:
+            agent_id: Agent whose long-term memory to search.
+            tenant_id: Tenant context.
+            query_embedding: Embedding vector for similarity search.
+            limit: Maximum results to return.
+            topic: Optional topic filter.
+
+        Returns:
+            List of memory entry dicts ordered by relevance.
+        """
+        return await self._memory.search_long_term(
+            agent_id=agent_id,
+            tenant_id=tenant_id,
+            query_embedding=query_embedding,
+            limit=limit,
+            topic=topic,
+            memory_type=None,
+            min_importance=0.0,
+            since_hours=None,
+        )
+
+
+class ReasoningService:
+    """Orchestrates LLM-based reasoning within the privilege and circuit breaker context.
+
+    Wraps ReasoningEngineProtocol and enforces circuit breaker checks before
+    every inference call to prevent cascading failures on LLM serving outages.
+    """
+
+    def __init__(
+        self,
+        reasoning_engine: ReasoningEngineProtocol,
+        circuit_breaker: CircuitBreakerProtocol,
+        observability: ObservabilityHooksProtocol,
+    ) -> None:
+        """Initialize with reasoning engine and supporting adapters.
+
+        Args:
+            reasoning_engine: Adapter implementing ReasoningEngineProtocol.
+            circuit_breaker: Circuit breaker for LLM serving protection.
+            observability: Observability hooks for token and trace recording.
+        """
+        self._engine = reasoning_engine
+        self._circuit_breaker = circuit_breaker
+        self._observability = observability
+
+    _LLM_SERVING_CIRCUIT_KEY = "llm_serving:default"
+
+    async def reason_chain_of_thought(
+        self,
+        agent_id: uuid.UUID,
+        task_description: str,
+        context: dict[str, Any],
+        tenant_id: str,
+        model_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Execute chain-of-thought reasoning with circuit breaker protection.
+
+        Args:
+            agent_id: Agent executing the reasoning.
+            task_description: Task to reason about.
+            context: Context dict for the reasoning engine.
+            tenant_id: Tenant context.
+            model_id: Optional model override.
+
+        Returns:
+            ReasoningTrace dict from the engine.
+
+        Raises:
+            PermissionDeniedError: If the LLM serving circuit breaker is OPEN.
+        """
+        if await self._circuit_breaker.is_open(self._LLM_SERVING_CIRCUIT_KEY, tenant_id):
+            raise PermissionDeniedError(
+                "LLM serving circuit breaker is OPEN — reasoning unavailable"
+            )
+
+        try:
+            trace = await self._engine.chain_of_thought(
+                agent_id=agent_id,
+                task_description=task_description,
+                context=context,
+                tenant_id=tenant_id,
+                model_id=model_id,
+            )
+            await self._circuit_breaker.record_success(self._LLM_SERVING_CIRCUIT_KEY, tenant_id)
+
+            # Record token consumption if trace has the field
+            if isinstance(trace, dict) and "total_tokens" in trace:
+                await self._observability.record_tokens_consumed(
+                    agent_id=agent_id,
+                    tenant_id=tenant_id,
+                    token_count=trace["total_tokens"],
+                    model_id=model_id or "default",
+                    action_type="chain_of_thought",
+                )
+
+            return trace if isinstance(trace, dict) else trace.to_dict()
+
+        except Exception as exc:
+            await self._circuit_breaker.record_failure(self._LLM_SERVING_CIRCUIT_KEY, tenant_id)
+            logger.error(
+                "Chain-of-thought reasoning failed",
+                agent_id=str(agent_id),
+                error=str(exc),
+                tenant_id=tenant_id,
+            )
+            raise
+
+    async def select_tools_for_task(
+        self,
+        agent_id: uuid.UUID,
+        task_description: str,
+        available_tools: list[dict[str, Any]],
+        tenant_id: str,
+        top_k: int = 5,
+        model_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Recommend relevant tools for a task using LLM-based reasoning.
+
+        Args:
+            agent_id: Agent requesting tool selection.
+            task_description: Task description to match tools against.
+            available_tools: Full list of available tool definitions.
+            tenant_id: Tenant context.
+            top_k: Maximum tools to recommend.
+            model_id: Optional model override.
+
+        Returns:
+            Sorted list of tool dicts with 'relevance_score' added.
+        """
+        if await self._circuit_breaker.is_open(self._LLM_SERVING_CIRCUIT_KEY, tenant_id):
+            # Fallback: return all tools without LLM ranking
+            logger.warning(
+                "LLM circuit open during tool selection — returning all tools unranked",
+                agent_id=str(agent_id),
+                tenant_id=tenant_id,
+            )
+            return available_tools[:top_k]
+
+        return await self._engine.select_tools(
+            agent_id=agent_id,
+            task_description=task_description,
+            available_tools=available_tools,
+            tenant_id=tenant_id,
+            top_k=top_k,
+            model_id=model_id,
+        )
+
+
+class ActionExecutionService:
+    """Coordinates sandboxed tool execution with privilege enforcement and audit logging.
+
+    Wraps ActionExecutorProtocol and enforces that agents can only invoke
+    tools they have access to, with all executions tracked via ObservabilityHooks.
+    """
+
+    def __init__(
+        self,
+        action_executor: ActionExecutorProtocol,
+        tool_registry: ToolRegistryProtocol,
+        observability: ObservabilityHooksProtocol,
+        security_sandbox: SecuritySandboxProtocol,
+    ) -> None:
+        """Initialize with execution and registry adapters.
+
+        Args:
+            action_executor: Adapter implementing ActionExecutorProtocol.
+            tool_registry: Tool registry for access control checks.
+            observability: Observability hooks for audit logging.
+            security_sandbox: Security sandbox for untrusted code execution.
+        """
+        self._executor = action_executor
+        self._tool_registry = tool_registry
+        self._observability = observability
+        self._sandbox = security_sandbox
+
+    async def execute_tool(
+        self,
+        agent_id: uuid.UUID,
+        tool_name: str,
+        tool_input: dict[str, Any],
+        tenant_id: str,
+        execution_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Execute a tool after verifying agent access rights.
+
+        Args:
+            agent_id: Agent requesting tool execution.
+            tool_name: Name of the tool to invoke.
+            tool_input: Input data for the tool.
+            tenant_id: Tenant context.
+            execution_id: Optional workflow execution correlation ID.
+
+        Returns:
+            Audit result dict from the action executor.
+
+        Raises:
+            PermissionDeniedError: If agent does not have access to the tool.
+            NotFoundError: If the tool is not registered.
+        """
+        # Check tool access
+        has_access = await self._tool_registry.check_access(agent_id, tool_name, tenant_id)
+        if not has_access:
+            logger.warning(
+                "Agent tool access denied",
+                agent_id=str(agent_id),
+                tool_name=tool_name,
+                tenant_id=tenant_id,
+            )
+            raise PermissionDeniedError(
+                f"Agent {agent_id} does not have access to tool '{tool_name}'"
+            )
+
+        # Retrieve tool definition
+        tool_def = await self._tool_registry.get_tool(tool_name, tenant_id)
+        if tool_def is None:
+            raise NotFoundError(f"Tool '{tool_name}' not found")
+
+        # Execute via action executor
+        return await self._executor.execute(
+            tool_name=tool_name,
+            tool_definition=tool_def,
+            tool_input=tool_input,
+            agent_id=agent_id,
+            tenant_id=tenant_id,
+            execution_id=execution_id,
+        )
+
+    async def execute_sandboxed_code(
+        self,
+        agent_id: uuid.UUID,
+        tenant_id: str,
+        code: str,
+        input_data: dict[str, Any],
+        agent_config: dict[str, Any],
+        privilege_level: int,
+    ) -> dict[str, Any]:
+        """Execute untrusted code in a Docker sandbox scoped to agent privilege.
+
+        Args:
+            agent_id: Agent requesting sandboxed execution.
+            tenant_id: Tenant context.
+            code: Python source code to execute.
+            input_data: Input data available to the code.
+            agent_config: Agent configuration for policy derivation.
+            privilege_level: Agent privilege level for resource limit scaling.
+
+        Returns:
+            SandboxExecutionResult dict.
+        """
+        policy = await self._sandbox.build_policy_for_agent(agent_config, privilege_level)
+        return await self._sandbox.execute_code(
+            code=code,
+            input_data=input_data,
+            agent_id=agent_id,
+            tenant_id=tenant_id,
+            policy=policy,
+        )
+
+
+class MultiAgentOrchestrationService:
+    """Manages inter-agent communication, task delegation, and coordination.
+
+    Provides a unified interface over MultiAgentCoordinatorProtocol with
+    automatic deadlock detection and privilege enforcement for delegation.
+    """
+
+    def __init__(
+        self,
+        coordinator: MultiAgentCoordinatorProtocol,
+        circuit_breaker: CircuitBreakerProtocol,
+    ) -> None:
+        """Initialize with coordinator and circuit breaker adapters.
+
+        Args:
+            coordinator: Adapter implementing MultiAgentCoordinatorProtocol.
+            circuit_breaker: Circuit breaker for coordinator health protection.
+        """
+        self._coordinator = coordinator
+        self._circuit_breaker = circuit_breaker
+
+    async def send_notification(
+        self,
+        sender_agent_id: uuid.UUID,
+        recipient_agent_id: uuid.UUID,
+        message: str,
+        tenant_id: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> str:
+        """Send a notification message from one agent to another.
+
+        Args:
+            sender_agent_id: Sending agent.
+            recipient_agent_id: Receiving agent.
+            message: Notification message string.
+            tenant_id: Tenant context.
+            metadata: Optional additional payload.
+
+        Returns:
+            Message ID string.
+        """
+        return await self._coordinator.send_message(
+            sender_agent_id=sender_agent_id,
+            recipient_agent_id=recipient_agent_id,
+            payload={"message": message, **(metadata or {})},
+            tenant_id=tenant_id,
+            message_type="notification",
+        )
+
+    async def delegate_with_result(
+        self,
+        delegator_agent_id: uuid.UUID,
+        delegate_agent_id: uuid.UUID,
+        task_description: str,
+        task_input: dict[str, Any],
+        tenant_id: str,
+        timeout_seconds: int = 60,
+    ) -> dict[str, Any]:
+        """Delegate a task and await the delegate's response.
+
+        Combines delegate_task + request_response for synchronous delegation.
+
+        Args:
+            delegator_agent_id: Agent delegating the task.
+            delegate_agent_id: Agent to perform the task.
+            task_description: Human-readable task description.
+            task_input: Structured task input.
+            tenant_id: Tenant context.
+            timeout_seconds: Response timeout.
+
+        Returns:
+            Response payload dict from the delegate agent.
+        """
+        await self._coordinator.delegate_task(
+            delegator_agent_id=delegator_agent_id,
+            delegate_agent_id=delegate_agent_id,
+            task_description=task_description,
+            task_input=task_input,
+            tenant_id=tenant_id,
+            priority=5,
+            requires_ack=True,
+        )
+
+        return await self._coordinator.request_response(
+            sender_agent_id=delegator_agent_id,
+            recipient_agent_id=delegate_agent_id,
+            request_payload=task_input,
+            tenant_id=tenant_id,
+            timeout_seconds=timeout_seconds,
+        )
