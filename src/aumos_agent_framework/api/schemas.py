@@ -2,7 +2,7 @@
 
 import uuid
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -267,3 +267,143 @@ class ToolResponse(BaseModel):
     created_at: datetime
 
     model_config = {"from_attributes": True}
+
+
+# ============================================================================
+# Streaming Schemas (Gap #132)
+# ============================================================================
+
+
+class WorkflowStreamEvent(BaseModel):
+    """Single event in a workflow execution SSE stream.
+
+    Each event has a type field indicating the event category:
+    - token: An LLM reasoning token (delta)
+    - tool_start: A tool invocation has begun
+    - tool_end: A tool invocation has completed
+    - node_complete: A workflow node has finished
+    - hitl_pause: Workflow paused for human approval
+    - workflow_complete: The workflow has finished
+    - error: An error occurred
+    """
+
+    event_type: Literal[
+        "token",
+        "tool_start",
+        "tool_end",
+        "node_complete",
+        "hitl_pause",
+        "workflow_complete",
+        "error",
+    ] = Field(..., description="Type of SSE event")
+    data: dict[str, Any] = Field(default_factory=dict, description="Event payload")
+    execution_id: uuid.UUID | None = Field(None, description="Workflow execution UUID")
+    node_id: str | None = Field(None, description="LangGraph node that emitted this event")
+    timestamp: datetime | None = Field(None, description="Event timestamp (UTC)")
+
+
+# ============================================================================
+# Execution Trace Schemas (Gap #131)
+# ============================================================================
+
+
+class ExecutionTraceResponse(BaseModel):
+    """Response schema for a single execution trace entry.
+
+    Traces capture the complete LLM call, tool call, or HITL event data
+    for each node in a workflow execution.
+    """
+
+    id: uuid.UUID = Field(..., description="Trace entry UUID")
+    execution_id: uuid.UUID = Field(..., description="Parent workflow execution UUID")
+    node_id: str = Field(..., description="LangGraph node that produced this trace")
+    trace_type: Literal["llm_call", "tool_call", "hitl_event"] = Field(
+        ..., description="Category of trace entry"
+    )
+    model_name: str | None = Field(None, description="LLM model used (llm_call only)")
+    prompt_tokens: int | None = Field(None, description="Input token count")
+    completion_tokens: int | None = Field(None, description="Output token count")
+    latency_ms: int | None = Field(None, description="Wall-clock latency in milliseconds")
+    tool_id: str | None = Field(None, description="Tool identifier (tool_call only)")
+    tool_error: str | None = Field(None, description="Tool error message if failed")
+    hitl_gate_name: str | None = Field(None, description="HITL gate name (hitl_event only)")
+    hitl_decision: str | None = Field(None, description="approved | rejected | timeout")
+    started_at: datetime = Field(..., description="Trace start timestamp (UTC)")
+    completed_at: datetime | None = Field(None, description="Trace completion timestamp (UTC)")
+    error: str | None = Field(None, description="Error message if trace failed")
+    created_at: datetime = Field(..., description="Record creation timestamp")
+
+    model_config = {"from_attributes": True}
+
+
+class ExecutionTraceListResponse(BaseModel):
+    """Paginated list of execution traces."""
+
+    items: list[ExecutionTraceResponse]
+    total: int
+    execution_id: uuid.UUID
+
+
+# ============================================================================
+# Checkpoint / Replay Schemas (Gap #133)
+# ============================================================================
+
+
+class CheckpointEvent(BaseModel):
+    """Single event from the Temporal workflow event history.
+
+    Temporal maintains a complete event log for every workflow execution.
+    This schema provides a human-readable representation of each event.
+    """
+
+    event_id: int = Field(..., description="Sequential event ID in the Temporal history")
+    event_type: str = Field(..., description="Temporal event type (e.g., WorkflowExecutionStarted)")
+    timestamp: datetime = Field(..., description="Event timestamp (UTC)")
+    data: dict[str, Any] = Field(default_factory=dict, description="Event-specific data")
+
+
+class CheckpointListResponse(BaseModel):
+    """List of checkpoint events for a workflow execution."""
+
+    execution_id: uuid.UUID
+    temporal_workflow_id: str | None
+    events: list[CheckpointEvent]
+    total: int
+
+
+class ReplayRequest(BaseModel):
+    """Request body for replaying a workflow execution with modified input."""
+
+    override_input: dict[str, Any] | None = Field(
+        None,
+        description="Optional input override. If omitted, uses original execution input.",
+    )
+
+
+# ============================================================================
+# Execution Node State Schema (Gap #128)
+# ============================================================================
+
+
+class ExecutionNodeStateResponse(BaseModel):
+    """Real-time state of a single node within a workflow execution."""
+
+    node_id: str = Field(..., description="LangGraph node identifier")
+    status: Literal["pending", "running", "completed", "failed", "hitl_paused"] = Field(
+        ..., description="Current node status"
+    )
+    started_at: datetime | None = Field(None, description="Node start timestamp")
+    completed_at: datetime | None = Field(None, description="Node completion timestamp")
+    error_message: str | None = Field(None, description="Error message if status is failed")
+
+
+# ============================================================================
+# Sandbox Guard Schemas (Gap #130)
+# ============================================================================
+
+
+class SandboxRateLimitResponse(BaseModel):
+    """Response when a sandbox rate limit is exceeded."""
+
+    detail: str = Field(..., description="Rate limit error message")
+    retry_after_seconds: int = Field(..., description="Seconds until the rate limit resets")

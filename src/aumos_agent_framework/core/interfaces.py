@@ -4,42 +4,199 @@ All adapters must implement these protocols to ensure the core services
 remain framework-independent and testable.
 """
 
-from typing import Any, Callable, Awaitable, Protocol, runtime_checkable
+from typing import Any, AsyncIterator, Callable, Awaitable, Protocol, runtime_checkable
 from uuid import UUID
+
+import pydantic
+
+
+# ============================================================================
+# AumOS-native workflow graph types (Gap #134 — LangGraph abstraction layer)
+# These types appear ONLY here and in langgraph_engine.py.
+# No other file should import from langgraph directly.
+# ============================================================================
+
+NodeFunction = Callable[[dict[str, Any]], dict[str, Any]]
+
+
+class WorkflowNodeDefinition(pydantic.BaseModel):
+    """AumOS-native definition of a workflow graph node.
+
+    This is the abstraction layer between the AumOS API and the underlying
+    graph execution engine (currently LangGraph). Swapping the engine requires
+    changes only in adapters/workflow_engine/langgraph_engine.py.
+    """
+
+    node_id: str = pydantic.Field(..., description="Unique node identifier within the workflow")
+    metadata: dict[str, Any] = pydantic.Field(
+        default_factory=dict,
+        description="Engine-specific node metadata (agent_id, system_prompt, etc.)",
+    )
+
+
+class WorkflowEdgeDefinition(pydantic.BaseModel):
+    """AumOS-native definition of an edge between workflow nodes."""
+
+    source_node_id: str = pydantic.Field(..., description="Source node identifier")
+    target_node_id: str = pydantic.Field(..., description="Target node identifier")
+    condition: str | None = pydantic.Field(
+        None,
+        description="Optional Python expression evaluated at runtime to decide traversal",
+    )
+
+
+class WorkflowGraphDefinition(pydantic.BaseModel):
+    """Complete AumOS workflow graph structure.
+
+    Consumed by WorkflowEngineProtocol.compile() to produce an executable graph.
+    No LangGraph types appear in this schema.
+    """
+
+    entry_point: str = pydantic.Field(..., description="Node ID where execution begins")
+    nodes: list[WorkflowNodeDefinition] = pydantic.Field(
+        ..., min_length=1, description="All nodes in the workflow graph"
+    )
+    edges: list[WorkflowEdgeDefinition] = pydantic.Field(
+        default_factory=list, description="Directed edges connecting nodes"
+    )
+    state_schema: dict[str, Any] = pydantic.Field(
+        default_factory=dict, description="JSON Schema for the graph state object"
+    )
+
+
+# ============================================================================
+# Pre-built tool protocol (Gap #129 — Tool marketplace)
+# ============================================================================
+
+
+class ToolInputSchema(pydantic.BaseModel):
+    """Base class for all tool input schemas. Override in each pre-built tool."""
+
+    pass
+
+
+class ToolOutputSchema(pydantic.BaseModel):
+    """Base class for all tool output schemas. Override in each pre-built tool."""
+
+    result: Any
+    metadata: dict[str, Any] = pydantic.Field(default_factory=dict)
+
+
+@runtime_checkable
+class AumOSToolProtocol(Protocol):
+    """Protocol that all AumOS pre-built tools must implement.
+
+    Tools are the atomic capabilities that agents can invoke.
+    Every tool is stateless — all context comes via input_data.
+
+    Attributes:
+        tool_id: Unique identifier, e.g. "web_search_serper".
+        display_name: Human-readable name for UI display.
+        category: Category bucket: "web", "data", "communication", "code", "document", "ai", "aumos".
+        description: What this tool does (shown in tool selector UI).
+        privilege_level: Minimum agent privilege to invoke (1-5).
+        input_schema: Pydantic model class for input validation.
+        output_schema: Pydantic model class for output validation.
+    """
+
+    tool_id: str
+    display_name: str
+    category: str
+    description: str
+    privilege_level: int
+    input_schema: type[ToolInputSchema]
+    output_schema: type[ToolOutputSchema]
+
+    async def execute(
+        self,
+        input_data: ToolInputSchema,
+        tenant_id: str,
+        config: dict[str, str],
+    ) -> ToolOutputSchema:
+        """Execute the tool with the provided input.
+
+        Args:
+            input_data: Validated input matching input_schema.
+            tenant_id: Tenant context for per-tenant rate limiting.
+            config: Tool-specific configuration (API keys, endpoints).
+
+        Returns:
+            Validated output matching output_schema.
+        """
+        ...
 
 
 @runtime_checkable
 class WorkflowEngineProtocol(Protocol):
-    """Executes graph-based workflows using LangGraph StateGraph."""
+    """Executes graph-based workflows using the AumOS workflow engine abstraction.
 
-    async def execute_workflow(
+    This protocol intentionally hides all LangGraph types. Callers interact only
+    with AumOS-native types (WorkflowGraphDefinition, WorkflowStreamEvent).
+    The LangGraph adapter in adapters/workflow_engine/langgraph_engine.py is the
+    only module that imports from langgraph.
+    """
+
+    async def compile(self, definition: WorkflowGraphDefinition) -> Any:
+        """Compile a workflow graph definition into an executable graph object.
+
+        Args:
+            definition: AumOS-native workflow graph definition.
+
+        Returns:
+            Engine-specific compiled graph object (opaque to callers).
+        """
+        ...
+
+    async def execute(
         self,
-        workflow_definition: dict[str, Any],
-        input_data: dict[str, Any],
+        compiled_graph: Any,
+        initial_state: dict[str, Any],
         execution_id: str,
         tenant_id: str,
     ) -> dict[str, Any]:
-        """Execute a workflow graph and return the output state.
+        """Execute a compiled workflow graph and return the final state.
 
         Args:
-            workflow_definition: Serialized LangGraph graph definition.
-            input_data: Initial state to inject into the graph.
-            execution_id: Unique execution ID for tracking.
-            tenant_id: Tenant context for isolation.
+            compiled_graph: Result of compile(), engine-specific type.
+            initial_state: Initial state dict for the workflow.
+            execution_id: Unique execution ID for tracing.
+            tenant_id: Tenant context for RLS isolation.
 
         Returns:
             Final state dict from the completed workflow graph.
         """
         ...
 
-    async def get_graph_nodes(self, workflow_definition: dict[str, Any]) -> list[str]:
-        """Return all node names in the workflow graph.
+    async def execute_streaming(
+        self,
+        compiled_graph: Any,
+        initial_state: dict[str, Any],
+        execution_id: str,
+        tenant_id: str,
+    ) -> AsyncIterator["WorkflowStreamEvent"]:  # type: ignore[type-arg]
+        """Execute a compiled workflow graph and yield streaming events.
+
+        Yields one event per LLM token, tool invocation, and node completion.
 
         Args:
-            workflow_definition: Serialized LangGraph graph definition.
+            compiled_graph: Result of compile(), engine-specific type.
+            initial_state: Initial state dict for the workflow.
+            execution_id: Unique execution ID for tracing.
+            tenant_id: Tenant context for RLS isolation.
+
+        Yields:
+            WorkflowStreamEvent for each significant workflow milestone.
+        """
+        ...
+
+    async def get_graph_nodes(self, definition: WorkflowGraphDefinition) -> list[str]:
+        """Return all node IDs in the workflow graph.
+
+        Args:
+            definition: AumOS-native workflow graph definition.
 
         Returns:
-            List of node name strings.
+            List of node ID strings.
         """
         ...
 
