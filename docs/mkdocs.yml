@@ -1,0 +1,71 @@
+site_name: AumOS Agent Framework
+site_description: Multi-agent orchestration infrastructure for the AumOS Enterprise platform
+site_author: MuVeraAI
+repo_url: https://github.com/muveraai/aumos-agent-framework
+repo_name: aumos-agent-framework
+
+theme:
+  name: material
+  palette:
+    - scheme: slate
+      primary: indigo
+      accent: indigo
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.expand
+    - search.suggest
+    - content.code.annotate
+    - content.code.copy
+
+plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          options:
+            docstring_style: google
+            show_source: true
+            members_order: source
+
+nav:
+  - Home: index.md
+  - Getting Started:
+    - Installation: getting-started/installation.md
+    - Quick Start: getting-started/quickstart.md
+    - Configuration: getting-started/configuration.md
+  - Core Concepts:
+    - Agents: concepts/agents.md
+    - Workflows: concepts/workflows.md
+    - HITL Gates: concepts/hitl.md
+    - Circuit Breakers: concepts/circuit-breakers.md
+    - Privilege Levels: concepts/privilege-levels.md
+  - Tool Marketplace:
+    - Overview: tools/overview.md
+    - Built-in Tools: tools/builtin.md
+    - Community Tools: tools/community.md
+    - Building Custom Tools: tools/custom.md
+  - Observability:
+    - Execution Traces: observability/traces.md
+    - SSE Streaming: observability/streaming.md
+    - Checkpoints & Replay: observability/checkpoints.md
+  - API Reference:
+    - REST API: api/rest.md
+    - Python SDK: api/sdk.md
+  - Integrations:
+    - LangGraph: integrations/langgraph.md
+    - Temporal: integrations/temporal.md
+    - OpenTelemetry: integrations/otel.md
+
+markdown_extensions:
+  - admonition
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - tables
+  - toc:
+      permalink: true

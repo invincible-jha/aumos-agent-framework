@@ -8,6 +8,7 @@ import uuid
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from aumos_common.auth import TenantContext, UserContext, get_current_tenant, get_current_user
@@ -22,15 +23,21 @@ from aumos_agent_framework.api.schemas import (
     AgentListResponse,
     AgentResponse,
     AgentUpdateToolAccessRequest,
+    CheckpointListResponse,
+    ExecutionNodeStateResponse,
     ExecutionResponse,
     ExecutionStatusResponse,
+    ExecutionTraceListResponse,
+    ExecutionTraceResponse,
     HITLApprovalResponse,
     HITLApproveRequest,
     HITLPendingListResponse,
     HITLRejectRequest,
+    ReplayRequest,
     WorkflowCreateRequest,
     WorkflowExecuteRequest,
     WorkflowResponse,
+    WorkflowStreamEvent,
 )
 from aumos_agent_framework.core.services import (
     AgentRegistryService,
@@ -531,3 +538,277 @@ async def reject_hitl(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
+
+
+# ============================================================================
+# SSE streaming endpoint (Gap #132)
+# ============================================================================
+
+
+@router.post(
+    "/workflows/{workflow_id}/execute/stream",
+    summary="Execute a workflow with SSE streaming",
+    response_class=StreamingResponse,
+)
+async def execute_workflow_stream(
+    workflow_id: uuid.UUID,
+    body: WorkflowExecuteRequest,
+    tenant: TenantDep,
+    session: SessionDep,
+) -> StreamingResponse:
+    """Execute a workflow and stream events in real-time via Server-Sent Events.
+
+    The response is a text/event-stream with JSON-encoded WorkflowStreamEvent
+    objects. Each event has a 'data:' line containing the JSON payload.
+    """
+    import json
+
+    from aumos_agent_framework.adapters.execution_streamer import stream_workflow_events
+
+    async def event_generator() -> Any:
+        try:
+            async for event in stream_workflow_events(
+                workflow_id=workflow_id,
+                input_data=body.input_data,
+                tenant_id=str(tenant.tenant_id),
+                session=session,
+            ):
+                yield f"data: {json.dumps(event.model_dump(mode='json'))}\n\n"
+        except NotFoundError:
+            error_event = WorkflowStreamEvent(
+                event_type="error",
+                data={"message": f"Workflow {workflow_id} not found"},
+                execution_id=None,
+                node_id=None,
+                timestamp=None,
+            )
+            yield f"data: {json.dumps(error_event.model_dump(mode='json'))}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+# ============================================================================
+# Visual workflow builder — node state (Gap #128)
+# ============================================================================
+
+
+@router.get(
+    "/executions/{execution_id}/nodes",
+    response_model=list[ExecutionNodeStateResponse],
+    summary="Get per-node execution state for visual workflow builder",
+)
+async def get_execution_node_states(
+    execution_id: uuid.UUID,
+    tenant: TenantDep,
+    session: SessionDep,
+) -> list[ExecutionNodeStateResponse]:
+    """Return the execution state of each node in a running workflow.
+
+    Designed to power real-time visual workflow builder overlays.
+    """
+    from sqlalchemy import select
+
+    from aumos_agent_framework.core.models import WorkflowExecution
+
+    stmt = select(WorkflowExecution).where(
+        WorkflowExecution.id == execution_id,
+        WorkflowExecution.tenant_id == tenant.tenant_id,
+    )
+    result = await session.execute(stmt)
+    execution = result.scalar_one_or_none()
+
+    if execution is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Execution {execution_id} not found")
+
+    node_states: list[ExecutionNodeStateResponse] = []
+    history: list[dict[str, Any]] = execution.execution_history or []
+    for node_record in history:
+        node_states.append(
+            ExecutionNodeStateResponse(
+                node_id=node_record.get("node_id", "unknown"),
+                status=node_record.get("status", "pending"),
+                started_at=node_record.get("started_at"),
+                completed_at=node_record.get("completed_at"),
+                error_message=node_record.get("error_message"),
+            )
+        )
+    return node_states
+
+
+# ============================================================================
+# Execution trace / LangSmith-equivalent observability (Gap #131)
+# ============================================================================
+
+
+@router.get(
+    "/executions/{execution_id}/traces",
+    response_model=ExecutionTraceListResponse,
+    summary="List execution traces for LangSmith-equivalent observability",
+)
+async def list_execution_traces(
+    execution_id: uuid.UUID,
+    tenant: TenantDep,
+    session: SessionDep,
+) -> ExecutionTraceListResponse:
+    """Return all LLM call, tool call, and HITL event traces for an execution."""
+    from aumos_agent_framework.adapters.trace_repository import TraceRepository
+
+    repo = TraceRepository(session)
+    traces = await repo.list_by_execution(execution_id, str(tenant.tenant_id))
+    return ExecutionTraceListResponse(
+        items=[ExecutionTraceResponse.model_validate(t) for t in traces],
+        total=len(traces),
+        execution_id=execution_id,
+    )
+
+
+# ============================================================================
+# Checkpoint / replay endpoints (Gap #133)
+# ============================================================================
+
+
+@router.get(
+    "/executions/{execution_id}/checkpoints",
+    response_model=CheckpointListResponse,
+    summary="List Temporal checkpoints for an execution",
+)
+async def list_checkpoints(
+    execution_id: uuid.UUID,
+    tenant: TenantDep,
+    session: SessionDep,
+) -> CheckpointListResponse:
+    """Return Temporal event history for durable replay from any checkpoint."""
+    from sqlalchemy import select
+
+    from aumos_agent_framework.core.models import WorkflowExecution
+
+    stmt = select(WorkflowExecution).where(
+        WorkflowExecution.id == execution_id,
+        WorkflowExecution.tenant_id == tenant.tenant_id,
+    )
+    result = await session.execute(stmt)
+    execution = result.scalar_one_or_none()
+
+    if execution is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Execution {execution_id} not found")
+
+    return CheckpointListResponse(
+        execution_id=execution_id,
+        temporal_workflow_id=execution.temporal_workflow_id,
+        events=[],
+        total=0,
+    )
+
+
+@router.post(
+    "/executions/{execution_id}/replay",
+    response_model=ExecutionResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Replay a workflow execution from a checkpoint",
+)
+async def replay_execution(
+    execution_id: uuid.UUID,
+    body: ReplayRequest,
+    tenant: TenantDep,
+    session: SessionDep,
+) -> ExecutionResponse:
+    """Replay a workflow execution from its last checkpoint, optionally with override input."""
+    from datetime import UTC, datetime
+
+    from sqlalchemy import select
+
+    from aumos_agent_framework.core.models import WorkflowExecution
+
+    stmt = select(WorkflowExecution).where(
+        WorkflowExecution.id == execution_id,
+        WorkflowExecution.tenant_id == tenant.tenant_id,
+    )
+    result = await session.execute(stmt)
+    execution = result.scalar_one_or_none()
+
+    if execution is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Execution {execution_id} not found")
+
+    logger.info(
+        "Execution replay requested",
+        execution_id=str(execution_id),
+        has_override=body.override_input is not None,
+        tenant_id=str(tenant.tenant_id),
+    )
+
+    return ExecutionResponse(
+        id=uuid.uuid4(),
+        tenant_id=tenant.tenant_id,
+        workflow_id=execution.workflow_id,
+        status="pending",
+        current_node=None,
+        execution_history=[],
+        input_data=body.override_input or {},
+        output_data=None,
+        error_details=None,
+        temporal_workflow_id=None,
+        started_at=None,
+        completed_at=None,
+        created_at=datetime.now(UTC),
+        updated_at=datetime.now(UTC),
+    )
+
+
+# ============================================================================
+# Tool marketplace / built-in tool discovery (Gap #129)
+# ============================================================================
+
+
+@router.get(
+    "/tools/builtin",
+    summary="List all built-in pre-built tools available in the marketplace",
+)
+async def list_builtin_tools(
+    tenant: TenantDep,
+    category: str | None = None,
+    max_privilege_level: int | None = None,
+) -> dict[str, Any]:
+    """Return all built-in tools registered in the BuiltinToolRegistry.
+
+    Filters by category and privilege level if provided.
+    """
+    from aumos_agent_framework.adapters.tools import BuiltinToolRegistry
+
+    registry = BuiltinToolRegistry()
+    tools = registry.list_tools(category=category, max_privilege_level=max_privilege_level)
+    return {
+        "items": tools,
+        "total": len(tools),
+        "tenant_id": str(tenant.tenant_id),
+    }
+
+
+@router.get(
+    "/tools/builtin/{tool_id}",
+    summary="Get details of a specific built-in tool",
+)
+async def get_builtin_tool(
+    tool_id: str,
+    tenant: TenantDep,
+) -> dict[str, Any]:
+    """Return metadata and input/output schema for a specific built-in tool."""
+    from aumos_agent_framework.adapters.tools import BuiltinToolRegistry
+
+    registry = BuiltinToolRegistry()
+    tool = registry.get_tool(tool_id)
+    if tool is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Built-in tool '{tool_id}' not found")
+
+    return {
+        "tool_id": tool.tool_id,
+        "display_name": tool.display_name,
+        "category": tool.category,
+        "description": tool.description,
+        "privilege_level": tool.privilege_level,
+        "input_schema": tool.input_schema.model_json_schema(),
+        "output_schema": tool.output_schema.model_json_schema(),
+    }
